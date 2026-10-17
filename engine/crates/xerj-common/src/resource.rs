@@ -283,9 +283,9 @@ pub enum PriorityAction {
     /// `nice(n)` on the calling **thread** — Linux semantics, where the nice
     /// value is a per-task attribute.
     NiceThread(i32),
-    /// `setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG)` — Darwin's
-    /// thread-scoped background tier.
-    DarwinThreadBackground,
+    /// `pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0)` — Darwin's
+    /// thread-scoped utility QoS class.
+    DarwinThreadUtility,
 }
 
 /// The platforms whose scheduling semantics differ enough to matter here.
@@ -317,16 +317,19 @@ pub const HOST_PLATFORM: Platform = if cfg!(target_os = "linux") {
 /// nice ceiling as pool threads start. That is the opposite of the intent, on
 /// the platform whose users reported the slowness (#240).
 ///
-/// Darwin's replacement is thread-scoped: `PRIO_DARWIN_THREAD` with
-/// `PRIO_DARWIN_BG` moves *this thread* into the background tier. It is an
-/// on/off tier, not a ladder rung, and it throttles I/O as well as CPU — right
-/// for merges, wrong for ingest and flush side-cars (a user's next search waits
-/// on those). So on macOS only the bottom rung is applied, and the two upper
-/// rungs stay at normal priority rather than being faked with a call that would
-/// deprioritize the whole process.
+/// Darwin's replacement is thread-scoped QoS. Merges get the utility class:
+/// below the default class every other thread runs at, so searches and ingest
+/// win the CPU, but without the background band's I/O throttle and
+/// efficiency-core confinement. So on macOS only the bottom rung is applied,
+/// and the two upper rungs stay at normal priority rather than being faked
+/// with a call that would deprioritize the whole process.
 ///
-/// This decision table is reasoned from documented POSIX/Darwin semantics and
-/// the libc surface; it has **not** been measured on Apple hardware.
+/// Measured on Apple silicon: merges used to go to the background band
+/// (`PRIO_DARWIN_THREAD` + `PRIO_DARWIN_BG`). Under load the two merge
+/// threads sat runnable at about 9% of a core each (`ps -M`: PRI 4, state R,
+/// 8.8% CPU, while a nice-15 `zstd -19` process on the same machine got
+/// about 19%), every merge stretched to minutes, and shutdown waited on
+/// them. The background band is the wrong rung for work that has to finish.
 pub const fn priority_action(platform: Platform, class: Deprioritize) -> PriorityAction {
     match platform {
         Platform::Linux => match class {
@@ -336,7 +339,7 @@ pub const fn priority_action(platform: Platform, class: Deprioritize) -> Priorit
         },
         Platform::MacOs => match class {
             Deprioritize::Ingest | Deprioritize::Background => PriorityAction::None,
-            Deprioritize::Maintenance => PriorityAction::DarwinThreadBackground,
+            Deprioritize::Maintenance => PriorityAction::DarwinThreadUtility,
         },
         // Windows and the BSDs: no per-thread nice with the semantics above.
         Platform::Other => PriorityAction::None,
@@ -356,12 +359,12 @@ pub fn deprioritize_current_thread(class: Deprioritize) {
                 let _ = libc::nice(_n);
             }
         }
-        PriorityAction::DarwinThreadBackground => {
+        PriorityAction::DarwinThreadUtility => {
             #[cfg(target_os = "macos")]
-            // SAFETY: `setpriority` with PRIO_DARWIN_THREAD and `who = 0`
-            // addresses the calling thread only.
+            // SAFETY: sets the calling thread's own QoS class; no pointers.
             unsafe {
-                let _ = libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, libc::PRIO_DARWIN_BG);
+                let _ =
+                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
             }
         }
     }
@@ -672,7 +675,7 @@ mod tests {
         }
         assert_eq!(
             priority_action(Platform::MacOs, Deprioritize::Maintenance),
-            PriorityAction::DarwinThreadBackground
+            PriorityAction::DarwinThreadUtility
         );
         // Ingest and flush side-cars stay at normal priority there: Darwin's
         // background tier throttles I/O, and a user's next search waits on them.
@@ -696,6 +699,40 @@ mod tests {
         assert_eq!(
             priority_action(Platform::Linux, Deprioritize::Maintenance),
             PriorityAction::NiceThread(15)
+        );
+    }
+
+    /// A merge-pool thread on macOS must not land in the Darwin background
+    /// band. That band (PRIO_DARWIN_BG) throttles the thread's I/O and holds
+    /// it to the efficiency cores: on a loaded Mac the two merge threads sat
+    /// runnable at about 9% of a core each, so every merge, and the shutdown
+    /// that waits on one, stretched to minutes. Utility QoS keeps merges
+    /// below foreground work without that throttle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_maintenance_thread_on_macos_runs_at_utility_qos_not_in_the_background_band() {
+        let (in_background_band, qos) = std::thread::spawn(|| {
+            deprioritize_current_thread(Deprioritize::Maintenance);
+            // SAFETY: both calls read the calling thread's own attributes.
+            let band = unsafe { libc::getpriority(libc::PRIO_DARWIN_THREAD, 0) };
+            let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut relative = 0;
+            let rc = unsafe {
+                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative)
+            };
+            assert_eq!(rc, 0, "pthread_get_qos_class_np failed");
+            (band != 0, class as u32)
+        })
+        .join()
+        .expect("probe thread");
+        assert!(
+            !in_background_band,
+            "maintenance thread is in the Darwin background band"
+        );
+        assert_eq!(
+            qos,
+            libc::qos_class_t::QOS_CLASS_UTILITY as u32,
+            "maintenance thread QoS"
         );
     }
 
