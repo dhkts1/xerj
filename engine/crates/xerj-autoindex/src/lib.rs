@@ -8510,11 +8510,22 @@ fn run_index_report_inner(
     // phase — split into named sub-phases because the mix of one-shot refreshes
     // and per-dataset round trips has no single honest denominator.
     pr.phase("finalize-refresh", 1 + graph.is_some() as u64, 0);
-    es.refresh(&format!("{}-*", cfg.prefix)).ok();
+    // Non-fatal, as before: the data is written either way. But a refresh
+    // that failed or timed out means the counts below can miss the last
+    // writes, and it used to vanish into `.ok()` with no trace.
+    let refresh_or_warn = |pattern: &str| {
+        if let Err(e) = es.refresh(pattern) {
+            eprintln!(
+                "autoindex: warning: final refresh of {pattern} failed: {e:#}; \
+                 the counts below may not include the last writes"
+            );
+        }
+    };
+    refresh_or_warn(&format!("{}-*", cfg.prefix));
     pr.item_done(0);
     // The dot-prefixed edges index is outside the {prefix}-* pattern.
     if let Some(gr) = &graph {
-        es.refresh(&gr.edges_index).ok();
+        refresh_or_warn(&gr.edges_index);
         pr.item_done(0);
     }
 
