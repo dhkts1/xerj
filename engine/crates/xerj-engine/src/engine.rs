@@ -117,6 +117,83 @@ pub fn set_allocator_purge_hook(hook: AllocatorPurgeHook) {
     *slot = Some(hook);
 }
 
+/// Minimum spacing between the sampler's near-watermark allocator purges.
+const MEMORY_PURGE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the memory sampler should purge the allocator now, given the
+/// process memory it just read and the breaker watermark (0 = none).
+///
+/// Purges once the process is at 75% of the watermark, so freed pages go back
+/// to the OS while there is still headroom instead of only after the breaker
+/// has engaged (see the test below for the measured cost of waiting).
+fn sampler_should_purge(process_bytes: u64, watermark_bytes: u64) -> bool {
+    watermark_bytes > 0 && process_bytes.saturating_mul(4) >= watermark_bytes.saturating_mul(3)
+}
+
+#[cfg(test)]
+mod sampler_purge_tests {
+    use super::sampler_should_purge;
+    const MIB: u64 = 1024 * 1024;
+
+    /// jemalloc keeps freed pages resident until they decay or are purged.
+    /// Linux decays them on its background thread; macOS has none, so they
+    /// decay only on allocator ticks. Under a 1 GiB cap the node's footprint
+    /// peaked at 1.53-1.74 GB while jemalloc `active` was 0.75-1.25 GB:
+    /// 450-620 MB of the peak was freed pages nobody returned. Before this,
+    /// the only purge ran at the END of a breaker drain, after every index
+    /// had flushed (~35 s after the trip in that run).
+    #[test]
+    fn the_sampler_purges_once_memory_nears_the_watermark() {
+        assert!(sampler_should_purge(730 * MIB, 972 * MIB));
+        assert!(sampler_should_purge(1500 * MIB, 972 * MIB));
+    }
+
+    #[test]
+    fn the_sampler_leaves_the_allocator_alone_with_headroom_or_no_watermark() {
+        assert!(!sampler_should_purge(500 * MIB, 972 * MIB));
+        assert!(!sampler_should_purge(10 * 1024 * MIB, 0));
+    }
+}
+
+/// Whether the breaker's automatic drain should flush memtables, given their
+/// summed size and the process memtable budget (0 = no budget).
+///
+/// Flush when the memtables hold at least a quarter of the budget, or when
+/// there is no budget to compare with. Below that, flushing frees little and
+/// writes a tiny segment per index; cache release plus the allocator purge
+/// return the retained pages. Small memtables are still flushed by the
+/// periodic and idle-age flushers (`flush_interval_secs`, `flush_idle_secs`),
+/// so nothing stays unflushed for long, and the explicit
+/// [`Engine::drain_rebuildable_memory`] keeps flushing everything.
+fn breaker_drain_flushes(total_memtable_bytes: u64, memtable_budget_bytes: u64) -> bool {
+    memtable_budget_bytes == 0 || total_memtable_bytes.saturating_mul(4) >= memtable_budget_bytes
+}
+
+#[cfg(test)]
+mod breaker_drain_tests {
+    use super::breaker_drain_flushes;
+    const MIB: u64 = 1024 * 1024;
+
+    /// A drain every 2 s while the breaker is engaged used to flush every
+    /// non-empty memtable, however small: 108 of 608 flushed segments in a
+    /// 1 GiB-cap run of an 88-index corpus held 5 documents or fewer, each
+    /// paying a full segment's side-car files and a later merge. A few MiB of
+    /// memtable is not what holds the breaker engaged.
+    #[test]
+    fn a_small_memtable_is_not_flushed_by_the_breaker() {
+        assert!(!breaker_drain_flushes(MIB, 256 * MIB));
+        assert!(!breaker_drain_flushes(63 * MIB, 256 * MIB));
+    }
+
+    #[test]
+    fn a_memtable_holding_a_real_share_of_the_budget_is_flushed() {
+        assert!(breaker_drain_flushes(64 * MIB, 256 * MIB));
+        assert!(breaker_drain_flushes(200 * MIB, 256 * MIB));
+        // No budget to measure against: keep the flush-first drain.
+        assert!(breaker_drain_flushes(1, 0));
+    }
+}
+
 /// Run the installed allocator purge, if any. Never panics: a broken hook
 /// must not take the drain (or the process) down — purging is an
 /// optimisation for RSS return, not a correctness step.
@@ -3957,6 +4034,34 @@ impl Engine {
         self.release_rebuildable_memory(&loaded).await
     }
 
+    /// The memory breaker's automatic drain: [`Self::drain_rebuildable_memory`],
+    /// except that it flushes only when the memtables hold a real share of the
+    /// memtable budget (see [`breaker_drain_flushes`]). Otherwise it releases
+    /// caches and purges the allocator, which is what returns retained pages.
+    pub async fn drain_rebuildable_memory_for_breaker(&self) -> usize {
+        // Purge first: it is cheap and immediate, while the flushes below can
+        // take tens of seconds across many indexes. The release path purges
+        // again at its end.
+        purge_allocator_pages();
+        let budget = crate::governor::global()
+            .map(|g| g.snapshot().memtable_budget_bytes)
+            .unwrap_or(0);
+        if breaker_drain_flushes(self.total_memtable_bytes(), budget) {
+            return self.drain_rebuildable_memory().await;
+        }
+        let loaded: Vec<Arc<Index>> = self
+            .indices
+            .iter()
+            .filter(|e| !self.closed_indices.contains_key(e.key().as_str()))
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        for idx in &loaded {
+            idx.release_memory();
+        }
+        purge_allocator_pages();
+        loaded.len()
+    }
+
     /// Flush then release the rebuildable caches of exactly `indices`, then
     /// purge the allocator (issue #950). The shared body of the
     /// memory-pressure drain and of `POST /{index}/_cache/clear`, so the
@@ -4022,7 +4127,7 @@ impl Engine {
                 let Some(engine) = weak_c.upgrade() else {
                     return; // engine dropped
                 };
-                let drained = handle.block_on(engine.drain_rebuildable_memory());
+                let drained = handle.block_on(engine.drain_rebuildable_memory_for_breaker());
                 tracing::info!(
                         indexes = drained,
                         "memory breaker engaged — drained rebuildable state (flush + cache release + purge)"
@@ -4060,6 +4165,7 @@ impl Engine {
             // disengaged (so the next engage edge fires immediately),
             // Some(last-drain) while engaged (rate-limited repeats).
             let mut last_drain_at: Option<std::time::Instant> = None;
+            let mut last_purge_at: Option<std::time::Instant> = None;
             loop {
                 std::thread::sleep(period);
                 if weak_a.strong_count() == 0 {
@@ -4072,6 +4178,17 @@ impl Engine {
                 let rss = crate::governor::current_rss_bytes();
                 let (disk_pct, disk_avail) = crate::governor::disk_used_pct_and_avail(&data_dir);
                 governor.refresh_memory_disk(rss, disk_pct, disk_avail);
+
+                // Near the watermark, return freed allocator pages before
+                // the breaker has to engage (see `sampler_should_purge`).
+                // At most once per MEMORY_PURGE_MIN_INTERVAL; touches no
+                // engine lock, only the allocator.
+                if sampler_should_purge(rss, governor.snapshot().memory_watermark_bytes)
+                    && last_purge_at.is_none_or(|at| at.elapsed() >= MEMORY_PURGE_MIN_INTERVAL)
+                {
+                    last_purge_at = Some(std::time::Instant::now());
+                    purge_allocator_pages();
+                }
 
                 // Issue #948 — a breaker that only rejects never lets a
                 // memory-pinned workload finish: caches hold gigabytes
