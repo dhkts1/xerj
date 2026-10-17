@@ -2537,6 +2537,58 @@ mod decide_flag_tests {
     }
 }
 
+/// Return every jemalloc arena's dirty pages to the OS (`arena.4096.purge`,
+/// 4096 being `MALLCTL_ARENAS_ALL`).
+///
+/// `arena.<i>.purge` is a void control: jemalloc rejects it with EPERM unless
+/// all four of `oldp`, `oldlenp`, `newp` and `newlen` are null/0
+/// (`NEITHER_READ_NOR_WRITE` in jemalloc's `ctl.c`). The earlier
+/// `tikv_jemalloc_ctl::raw::write(.., 0u64)` passed a value, so every purge
+/// failed and the error was discarded. On Linux `background_thread:true`
+/// hid it; on macOS there is no background thread, and the drain freed
+/// nothing back to the OS.
+#[cfg(not(target_env = "msvc"))]
+fn purge_all_jemalloc_arenas() -> Result<(), i32> {
+    // SAFETY: the name is a NUL-terminated literal naming a real ctl node,
+    // and a void control reads and writes nothing, so null pointers and a
+    // zero length are exactly what it requires.
+    let rc = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"arena.4096.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(rc)
+    }
+}
+
+#[cfg(all(test, not(target_env = "msvc")))]
+mod allocator_purge_tests {
+    use super::purge_all_jemalloc_arenas;
+
+    /// The memory drain's purge must actually run. `arena.<i>.purge` is a
+    /// void control: jemalloc answers EPERM to any call that passes a new
+    /// value (`ctl.c`, `NEITHER_READ_NOR_WRITE`), so a "write 0" purge is a
+    /// silent no-op and the drain returns nothing to the OS.
+    #[test]
+    fn arena_purge_succeeds() {
+        // Dirty some pages first so the purge has work to do.
+        let blocks: Vec<Vec<u8>> = (0..64).map(|i| vec![i as u8; 256 * 1024]).collect();
+        drop(std::hint::black_box(blocks));
+        assert_eq!(
+            purge_all_jemalloc_arenas(),
+            Ok(()),
+            "arena.4096.purge must return 0"
+        );
+    }
+}
+
 #[cfg(test)]
 mod runtime_tests {
     use super::build_runtime;
@@ -3332,11 +3384,14 @@ async fn async_main() -> Result<()> {
             // MALLCTL_ARENAS_ALL. Both are best-effort: a failing mallctl
             // must never propagate out of the drain path.
             let _ = tikv_jemalloc_ctl::epoch::advance();
-            // SAFETY: `arena.<i>.purge` with i = MALLCTL_ARENAS_ALL (4096)
-            // is a plain "purge every arena" action mallctl; the value is an
-            // unused unsigned scalar. The name is NUL-terminated and names a
-            // real jemalloc ctl node, so the write cannot read out of bounds.
-            let _ = unsafe { tikv_jemalloc_ctl::raw::write(b"arena.4096.purge\0", 0u64) };
+            // Best-effort as before, but no longer silent: a purge that
+            // fails is a drain that returns nothing to the OS. Warn once.
+            if let Err(rc) = purge_all_jemalloc_arenas() {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    warn!("jemalloc arena.4096.purge failed (mallctl returned {rc}); memory drains will not return pages to the OS");
+                });
+            }
         }));
         state.engine.spawn_resource_sampler();
     }
