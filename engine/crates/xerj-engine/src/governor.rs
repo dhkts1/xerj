@@ -561,9 +561,8 @@ pub struct GovernorSnapshot {
 }
 
 /// Auto-derive the memtable byte ceiling from the effective (cgroup-aware)
-/// memory limit: 25% of the limit, floored at 2 GiB, but never past 50% of
-/// the same limit. The 50% cap keeps the floor itself from exceeding the
-/// container under a small enough effective limit.
+/// memory limit: 25% of the limit (see `auto_memtable_budget` for why the
+/// former 2 GiB floor is gone).
 ///
 /// `effective_limit` must already be the cgroup-aware value (see
 /// `effective_memory_limit_bytes`) — this function has no way to detect a
@@ -717,14 +716,16 @@ fn resolve_process_memory_cap(
 }
 
 fn auto_memtable_budget(effective_limit: u64) -> u64 {
-    // The 2 GiB floor is clamped by the 50% ceiling on the SAME effective
-    // limit, so an 8 GiB cap yields 2 GiB (25% = 2 GiB) and a 2 GiB effective
-    // limit yields 1 GiB rather than the floor's 2 GiB. The floor raises a
-    // budget on a roomy host; it must never hand out more than half of what
-    // the host — or the configured cap — actually allows.
-    (effective_limit / 4)
-        .max(2 * 1024 * 1024 * 1024)
-        .min(effective_limit / 2)
+    // A quarter of the effective limit, at every size.
+    //
+    // This used to be `(limit / 4).max(2 GiB).min(limit / 2)`, described as
+    // a floor that "raises a budget on a roomy host". It never did: at 8 GiB
+    // and above a quarter is already at least 2 GiB, so the floor only ever
+    // won BELOW 8 GiB, where it handed memtables half the cap. Under a 1 GiB
+    // cap that was 512 MiB, beside a 204 MiB hydration cache (20%) and a
+    // 972 MiB RSS watermark (95%): the budgets alone summed past the
+    // watermark, and the breaker spent the run tripping.
+    effective_limit / 4
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -872,9 +873,7 @@ fn build(config: &Config) -> ResourceGovernor {
     // same effective limit as every sibling budget in this function, not
     // raw host RAM: `/proc/meminfo` is not namespace-virtualized, so a
     // host-RAM-based ceiling silently ignores any cgroup / `systemd-run -p
-    // MemoryMax=` cap smaller than the host's physical RAM. The 2 GiB floor
-    // needs its own ceiling for the same reason — it can exceed the whole
-    // effective limit under a small enough cap on its own.
+    // MemoryMax=` cap smaller than the host's physical RAM.
     let memtable_budget_bytes = if limits.max_total_memtable_mb != 0 {
         limits.max_total_memtable_mb.saturating_mul(1024 * 1024)
     } else {
@@ -1548,9 +1547,8 @@ mod tests {
         assert_eq!(cap_memory_limit(512 * 1024 * 1024, 8192), 512 * 1024 * 1024);
     }
 
-    /// The 2 GiB memtable floor must not punch through a smaller ceiling —
-    /// otherwise the floor alone would hand out the entire cap, or more than
-    /// the machine has.
+    /// The memtable budget must never hand out more than half a capped base
+    /// (it is a quarter now; this kept the former 2 GiB floor in check).
     #[test]
     fn the_memtable_floor_cannot_exceed_half_the_capped_base() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -1562,18 +1560,22 @@ mod tests {
                 "memtable budget {budget} exceeds half of a {base_gib} GiB base"
             );
         }
-        // Concretely: at the 8 GiB AUTO tier the floor does not apply at all.
+        // Concretely: at the 8 GiB AUTO tier the budget is a quarter, 2 GiB.
         assert_eq!(auto_memtable_budget(8 * GIB), 2 * GIB);
-        // And under a 2 GiB cgroup the floor is clamped to 1 GiB, not 2.
-        assert_eq!(auto_memtable_budget(2 * GIB), GIB);
+        // And under a 2 GiB cgroup it is a quarter too, 512 MiB, not half.
+        assert_eq!(auto_memtable_budget(2 * GIB), 512 * 1024 * 1024);
     }
 
     #[test]
     fn auto_memtable_budget_is_cgroup_proportional_and_bounded() {
         const GIB: u64 = 1024 * 1024 * 1024;
+        // A quarter of the limit at every size. Under a small cap the old
+        // 2 GiB floor (clamped to half) handed memtables 50%: 512 MiB of a
+        // 1 GiB cap, beside a 204 MiB hydration cache and a 972 MiB
+        // watermark, so the budgets alone summed past the watermark.
         let cases = [
-            (GIB, 512 * 1024 * 1024),
-            (4 * GIB, 2 * GIB),
+            (GIB, 256 * 1024 * 1024),
+            (4 * GIB, GIB),
             (8 * GIB, 2 * GIB),
             (64 * GIB, 16 * GIB),
         ];

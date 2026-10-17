@@ -9322,6 +9322,43 @@ pub struct Index {
     merge_fts_reanalysed_docs: Arc<AtomicU64>,
 }
 
+/// The merge batch input cap for a numeric `XERJ_MAX_PROCESS_MEMORY_MB`
+/// (see `Index::merge_batch_cap_bytes`).
+fn merge_batch_cap_for_process_cap(limit_mb: Option<u64>) -> u64 {
+    const MB: u64 = 1024 * 1024;
+    match limit_mb {
+        Some(limit_mb) if limit_mb > 0 => (limit_mb / 64).clamp(8, 512) * MB,
+        _ => 512 * MB,
+    }
+}
+
+#[cfg(test)]
+mod merge_batch_cap_tests {
+    use super::merge_batch_cap_for_process_cap;
+    const MB: u64 = 1024 * 1024;
+
+    /// Under a 1 GiB cap the 32 MiB floor won over cap/64 (16 MiB). A merge
+    /// holds 5-9x its input decoded (and a second parse in the stored
+    /// encoder that no gauge counts): 32 MiB of input put about 450 MB in
+    /// `merge_parsed` and ~1.1 GB allocated against a 972 MB watermark.
+    #[test]
+    fn a_small_cap_gets_cap_over_64_not_the_old_32_mib_floor() {
+        assert_eq!(merge_batch_cap_for_process_cap(Some(1024)), 16 * MB);
+        assert_eq!(merge_batch_cap_for_process_cap(Some(512)), 8 * MB);
+        assert_eq!(merge_batch_cap_for_process_cap(Some(256)), 8 * MB);
+    }
+
+    /// Caps of 2 GiB and up keep the documented formula unchanged.
+    #[test]
+    fn larger_caps_keep_cap_over_64_clamped_at_512_mib() {
+        assert_eq!(merge_batch_cap_for_process_cap(Some(2048)), 32 * MB);
+        assert_eq!(merge_batch_cap_for_process_cap(Some(16 * 1024)), 256 * MB);
+        assert_eq!(merge_batch_cap_for_process_cap(Some(64 * 1024)), 512 * MB);
+        assert_eq!(merge_batch_cap_for_process_cap(None), 512 * MB);
+        assert_eq!(merge_batch_cap_for_process_cap(Some(0)), 512 * MB);
+    }
+}
+
 impl Index {
     /// Apply a WAL-consumer retention floor to this index's WAL shards, live.
     ///
@@ -12392,7 +12429,8 @@ impl Index {
     /// `LogMergePolicy` filters candidates by size before batching
     /// (`max_docs_before_merge`, `src/indexer/log_merge_policy.rs:22,94`).
     ///
-    /// Derived: `clamp(process cap / 64, 32 MiB, 512 MiB)` — at #948's
+    /// Derived: `clamp(process cap / 64, 8 MiB, 512 MiB)` (the floor was
+    /// 32 MiB, which under a 1 GiB cap overrode cap/64) — at #948's
     /// 16 GiB auto-cap that is a 256 MiB batch, i.e. a worst-case merge
     /// working set of ~1.5-2.4 GiB at the measured multipliers.
     /// `XERJ_MERGE_BATCH_MAX_INPUT_MB` overrides (0 disables the bound).
@@ -12405,13 +12443,11 @@ impl Index {
                 return mb * MB;
             }
         }
-        match std::env::var("XERJ_MAX_PROCESS_MEMORY_MB")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-        {
-            Some(limit_mb) if limit_mb > 0 => (limit_mb / 64).clamp(32, 512) * MB,
-            _ => 512 * MB,
-        }
+        merge_batch_cap_for_process_cap(
+            std::env::var("XERJ_MAX_PROCESS_MEMORY_MB")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok()),
+        )
     }
 
     /// One merge pass.  Caller MUST hold `merge_in_progress` (and clear it
