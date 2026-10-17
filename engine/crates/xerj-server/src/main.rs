@@ -2070,7 +2070,33 @@ fn main() -> Result<()> {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| (cores * 8).clamp(64, 512));
     let rt = build_runtime(worker_threads)?;
-    rt.block_on(async_main())
+    run_to_exit(rt, async_main())
+}
+
+/// How long exit waits for blocking jobs still running after `async_main`
+/// returns ("Goodbye" has been logged and the final flush is done).
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Drive the server future to completion, then tear the runtime down without
+/// waiting more than [`RUNTIME_SHUTDOWN_TIMEOUT`] for blocking jobs.
+///
+/// Dropping a `Runtime` joins its blocking pool with no time limit. After
+/// SIGTERM the one job left there is usually a background merge, detached by
+/// `spawn_blocking` and parked in the merge pool, which can spend minutes
+/// compressing a large column at zstd 19 on a low-priority thread. The
+/// process then outlived "Goodbye" by however long that merge had left
+/// (90 s+ measured on macOS), and a supervisor's stop timeout killed it.
+///
+/// Walking away from that merge is safe: a merge publishes atomically through
+/// `apply_merge`, and an unfinished batch leaves its input segments untouched
+/// (the LOSS FIREWALL notes in `xerj-engine`'s `index.rs`). The final
+/// `flush_all_force` has completed before `async_main` returns, and leaving a
+/// job unfinished here is no different from the SIGKILL or power loss the
+/// engine is already built to recover from.
+fn run_to_exit<F: std::future::Future>(rt: tokio::runtime::Runtime, fut: F) -> F::Output {
+    let out = rt.block_on(fut);
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    out
 }
 
 /// Explicit worker-thread stack size for the production Tokio runtime.
@@ -2491,7 +2517,33 @@ mod allocator_purge_tests {
 
 #[cfg(test)]
 mod runtime_tests {
-    use super::build_runtime;
+    use super::{build_runtime, run_to_exit};
+
+    /// SIGTERM → "Goodbye" → exit must not wait on a blocking job that is
+    /// still running (in production: a background merge compressing a large
+    /// column on a low-priority thread). Dropping a Runtime joins its blocking
+    /// pool with no timeout, so the process outlived "Goodbye" by as long as
+    /// the job had left.
+    #[test]
+    fn exit_does_not_wait_for_a_running_blocking_job() {
+        let rt = build_runtime(2).expect("prod runtime builds");
+        let started = std::time::Instant::now();
+        run_to_exit(rt, async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            // Detached, like the merge task: nothing awaits it.
+            drop(tokio::task::spawn_blocking(move || {
+                let _ = tx.send(());
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }));
+            // Make sure the job is really running before the server returns.
+            rx.await.expect("blocking job started");
+        });
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "exit waited {waited:?} for a detached blocking job"
+        );
+    }
 
     #[test]
     fn runtime_builds_and_boots() {
