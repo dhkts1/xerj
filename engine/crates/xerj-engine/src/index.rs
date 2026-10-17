@@ -9359,6 +9359,63 @@ mod merge_batch_cap_tests {
     }
 }
 
+/// Whether a merge also tries the long-effort zstd candidate (level 19 with
+/// long-distance matching) on every JSON fallback stored column.
+///
+/// Only when the operator asked for size (`compression.level = "best"`) or
+/// for an explicit forcemerge. A background merge during bulk ingest at the
+/// default level does not: on a 113 MB code-and-prose corpus that candidate
+/// was the largest on-CPU cost of the whole ingest (one merge thread spent
+/// 1.65 CPU-s per MB indexed, 100% of its busy time under
+/// `encode_v2_columns` with zstd-19 leaves). On a 20 MB slice of the same
+/// corpus level 19 + `--long=24` ran at 2.55 MB per CPU-second against 286
+/// for level 3, for output 19% smaller. Segments a background merge writes
+/// can still reach the long-effort size later: the next forcemerge or a
+/// `best` merge re-encodes them. Flush never ran the candidate and still
+/// does not.
+fn merge_runs_long_effort_chooser(
+    level: xerj_common::config::CompressionLevel,
+    forcemerge: bool,
+) -> bool {
+    forcemerge || level == xerj_common::config::CompressionLevel::Best
+}
+
+#[cfg(test)]
+mod merge_long_effort_tests {
+    use super::merge_runs_long_effort_chooser;
+    use xerj_common::config::CompressionLevel;
+
+    /// A background merge at the default level must not pay level 19. It cost
+    /// 1.65 CPU-s per MB indexed on one merge thread, the largest on-CPU cost
+    /// of a bulk ingest, for a 19% smaller stored column.
+    #[test]
+    fn background_merges_at_the_default_level_skip_the_level_19_candidate() {
+        assert!(!merge_runs_long_effort_chooser(
+            CompressionLevel::Balanced,
+            false
+        ));
+        assert!(!merge_runs_long_effort_chooser(
+            CompressionLevel::Fast,
+            false
+        ));
+    }
+
+    /// The operator asked for size (`best`), or for one final segment
+    /// (forcemerge, which is how the index-size harness measures): keep it.
+    #[test]
+    fn best_and_forcemerge_keep_the_level_19_candidate() {
+        assert!(merge_runs_long_effort_chooser(
+            CompressionLevel::Best,
+            false
+        ));
+        assert!(merge_runs_long_effort_chooser(
+            CompressionLevel::Balanced,
+            true
+        ));
+        assert!(merge_runs_long_effort_chooser(CompressionLevel::Fast, true));
+    }
+}
+
 impl Index {
     /// Apply a WAL-consumer retention floor to this index's WAL shards, live.
     ///
@@ -12700,6 +12757,10 @@ impl Index {
             // is precisely why raising the effort here is safe and raising it
             // on flush was not.
             let merge_zstd_level = self.compression_config.level.zstd_level();
+            let long_effort_for_task = merge_runs_long_effort_chooser(
+                self.compression_config.level,
+                force_max_segments.is_some(),
+            );
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
@@ -13199,12 +13260,20 @@ impl Index {
                         }
                     };
                     let stored_timer = std::time::Instant::now();
-                    // The merge entry also runs the per-column long-effort
-                    // zstd chooser (#1038) — background-only by contract.
-                    let encoded = xerj_storage::stored_codec::encode_stored_v2_merge_at_level(
-                        &merged_json_buf,
-                        merge_zstd_level,
-                    );
+                    // The merge entry can also run the per-column long-effort
+                    // zstd chooser (#1038) — background-only by contract, and
+                    // only when `merge_runs_long_effort_chooser` says so.
+                    let encoded = if long_effort_for_task {
+                        xerj_storage::stored_codec::encode_stored_v2_merge_at_level(
+                            &merged_json_buf,
+                            merge_zstd_level,
+                        )
+                    } else {
+                        xerj_storage::stored_codec::encode_stored_v2_at_level(
+                            &merged_json_buf,
+                            merge_zstd_level,
+                        )
+                    };
                     // #948 attribution: the compressed output buffer is an
                     // exact owned length; it coexists with the drained buffer
                     // for one encode call.
