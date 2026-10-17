@@ -155,45 +155,6 @@ mod sampler_purge_tests {
     }
 }
 
-/// Whether the breaker's automatic drain should flush memtables, given their
-/// summed size and the process memtable budget (0 = no budget).
-///
-/// Flush when the memtables hold at least a quarter of the budget, or when
-/// there is no budget to compare with. Below that, flushing frees little and
-/// writes a tiny segment per index; cache release plus the allocator purge
-/// return the retained pages. Small memtables are still flushed by the
-/// periodic and idle-age flushers (`flush_interval_secs`, `flush_idle_secs`),
-/// so nothing stays unflushed for long, and the explicit
-/// [`Engine::drain_rebuildable_memory`] keeps flushing everything.
-fn breaker_drain_flushes(total_memtable_bytes: u64, memtable_budget_bytes: u64) -> bool {
-    memtable_budget_bytes == 0 || total_memtable_bytes.saturating_mul(4) >= memtable_budget_bytes
-}
-
-#[cfg(test)]
-mod breaker_drain_tests {
-    use super::breaker_drain_flushes;
-    const MIB: u64 = 1024 * 1024;
-
-    /// A drain every 2 s while the breaker is engaged used to flush every
-    /// non-empty memtable, however small: 108 of 608 flushed segments in a
-    /// 1 GiB-cap run of an 88-index corpus held 5 documents or fewer, each
-    /// paying a full segment's side-car files and a later merge. A few MiB of
-    /// memtable is not what holds the breaker engaged.
-    #[test]
-    fn a_small_memtable_is_not_flushed_by_the_breaker() {
-        assert!(!breaker_drain_flushes(MIB, 256 * MIB));
-        assert!(!breaker_drain_flushes(63 * MIB, 256 * MIB));
-    }
-
-    #[test]
-    fn a_memtable_holding_a_real_share_of_the_budget_is_flushed() {
-        assert!(breaker_drain_flushes(64 * MIB, 256 * MIB));
-        assert!(breaker_drain_flushes(200 * MIB, 256 * MIB));
-        // No budget to measure against: keep the flush-first drain.
-        assert!(breaker_drain_flushes(1, 0));
-    }
-}
-
 /// Run the installed allocator purge, if any. Never panics: a broken hook
 /// must not take the drain (or the process) down — purging is an
 /// optimisation for RSS return, not a correctness step.
@@ -4034,32 +3995,20 @@ impl Engine {
         self.release_rebuildable_memory(&loaded).await
     }
 
-    /// The memory breaker's automatic drain: [`Self::drain_rebuildable_memory`],
-    /// except that it flushes only when the memtables hold a real share of the
-    /// memtable budget (see [`breaker_drain_flushes`]). Otherwise it releases
-    /// caches and purges the allocator, which is what returns retained pages.
+    /// The memory breaker's automatic drain: [`Self::drain_rebuildable_memory`]
+    /// with an allocator purge in front of it.
+    ///
+    /// It always flushes. The memtable's byte estimate undercounts what it
+    /// holds several times over, so no threshold on that estimate can tell a
+    /// flush that frees little from one that frees hundreds of MB; a version
+    /// of this drain that skipped "small" memtables made the breaker trip
+    /// more, not less (see the test in `tests/drain_releases_memory.rs`).
     pub async fn drain_rebuildable_memory_for_breaker(&self) -> usize {
         // Purge first: it is cheap and immediate, while the flushes below can
         // take tens of seconds across many indexes. The release path purges
         // again at its end.
         purge_allocator_pages();
-        let budget = crate::governor::global()
-            .map(|g| g.snapshot().memtable_budget_bytes)
-            .unwrap_or(0);
-        if breaker_drain_flushes(self.total_memtable_bytes(), budget) {
-            return self.drain_rebuildable_memory().await;
-        }
-        let loaded: Vec<Arc<Index>> = self
-            .indices
-            .iter()
-            .filter(|e| !self.closed_indices.contains_key(e.key().as_str()))
-            .map(|e| Arc::clone(e.value()))
-            .collect();
-        for idx in &loaded {
-            idx.release_memory();
-        }
-        purge_allocator_pages();
-        loaded.len()
+        self.drain_rebuildable_memory().await
     }
 
     /// Flush then release the rebuildable caches of exactly `indices`, then

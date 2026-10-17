@@ -115,6 +115,29 @@ async fn drain_flushes_so_unrefreshed_docs_survive() {
     );
 }
 
+/// The breaker's automatic drain flushes too, however small the memtable
+/// reads. The memtable's byte estimate undercounts what it holds several
+/// times over (a flush that moved the `memtable_active` gauge by 108 MB moved
+/// jemalloc `allocated` by 772 MB), so a "too small to flush" threshold on
+/// the estimate skipped flushes that would have freed real memory: in a
+/// paired 1 GiB-cap run the breaker then tripped 137 times against 93.
+#[tokio::test]
+async fn the_breaker_drain_flushes_a_small_memtable() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    seed(&engine, "docs", 30).await; // NO refresh — docs sit in the memtable
+    assert!(engine.get_index("docs").unwrap().memtable_bytes() > 0);
+
+    let drained = engine.drain_rebuildable_memory_for_breaker().await;
+    assert_eq!(drained, 1);
+    assert_eq!(
+        engine.get_index("docs").unwrap().memtable_bytes(),
+        0,
+        "the breaker drain must flush the memtable"
+    );
+    assert_eq!(count_all(&engine, "docs").await, 30);
+}
+
 /// A closed index is skipped (its caches were already released by
 /// `close_index`), and its existence must not abort the drain for the rest.
 #[tokio::test]
